@@ -1,5 +1,6 @@
 """DAG 1: bmkg_weather_etl - ETL prakiraan cuaca BMKG (31 Kecamatan Kota Surabaya)."""
 import json
+import os
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
@@ -13,13 +14,15 @@ from airflow.exceptions import AirflowFailException
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 # ---------- Konfigurasi ----------
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-RAW_DIR = PROJECT_DIR / "data" / "raw"
-PROCESSED_DIR = PROJECT_DIR / "data" / "processed"
-DB_FILE = PROJECT_DIR / "data" / "bmkg_weather.db"
-LOCATIONS = json.loads(
-    (PROJECT_DIR / "config" / "locations.json").read_text(encoding="utf-8")
+PROJECT_DIR = Path(__file__).resolve().parents[1]   # di Docker: /opt/airflow
+OUTPUT_DIR = Path(
+    os.environ.get("BMKG_OUTPUT_DIR", "/opt/airflow/dags/output_project_bmkg")
 )
+RAW_DIR = OUTPUT_DIR / "raw"
+PROCESSED_DIR = OUTPUT_DIR / "processed"
+DB_FILE = OUTPUT_DIR / "cuaca_surabaya.db"
+CONFIG_FILE = PROJECT_DIR / "config" / "locations.json"
+LOCATIONS = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
 
 API_URL = "https://api.bmkg.go.id/publik/prakiraan-cuaca"
 HEADERS = {
@@ -268,19 +271,25 @@ def load(csv_path):
     ddl = ("CREATE TABLE IF NOT EXISTS weather_forecast ("
            + ", ".join(f"{c} {t}" for c, t in COLUMNS.items())
            + ", PRIMARY KEY (location_code, forecast_utc, analysis_utc))")
-    sql = (f"INSERT OR REPLACE INTO weather_forecast ({', '.join(cols)}) "
+    sql = (f"INSERT OR IGNORE INTO weather_forecast ({', '.join(cols)}) "
            f"VALUES ({', '.join('?' * len(cols))})")
     records = [tuple(r) for r in df[cols].itertuples(index=False, name=None)]
 
-    conn = sqlite3.connect(DB_FILE)
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_FILE, timeout=30)
     try:
         with conn:
             conn.execute(ddl)
+            before = conn.total_changes
             conn.executemany(sql, records)
+            inserted = conn.total_changes - before
     finally:
         conn.close()
-    print(f"load: {len(records)} baris diproses ke {DB_FILE}")
-    return len(records)
+    print(
+        f"load: {len(records)} baris diproses, {inserted} baris baru, "
+        f"{len(records) - inserted} dilewati (kunci sudah ada) -> {DB_FILE}"
+    )
+    return inserted
 
 
 # ---------- DAG ----------
@@ -298,6 +307,7 @@ default_args = {
     start_date=pendulum.datetime(2026, 11, 1, tz="Asia/Jakarta"),
     schedule=None,          # Fase D: "0 10,22 * * *" (WIB)
     catchup=False,
+    max_active_runs=1,
     default_args=default_args,
     tags=["uas", "bmkg", "etl"],
 )
