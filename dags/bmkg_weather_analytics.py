@@ -1,43 +1,50 @@
 """DAG 2: bmkg_weather_analytics - Analitik cuaca BMKG (cuaca ekstrem & ringkasan harian)."""
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pendulum
 from airflow.decorators import dag, task
+from airflow.exceptions import AirflowFailException
 
 # ---------- Konfigurasi ----------
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-DB_FILE = PROJECT_DIR / "data" / "bmkg_weather.db"
+OUTPUT_DIR = Path(
+    os.environ.get("BMKG_OUTPUT_DIR", "/opt/airflow/dags/output_project_bmkg")
+)
+DB_FILE = OUTPUT_DIR / "cuaca_surabaya.db"
 
 # Batas ambang cuaca ekstrem
 EXTREME_THRESHOLDS = {
     "precip": 20.0,            # mm (hujan lebat)
-    "wind_speed_kmh": 30.0,     # km/jam (angin kencang)
-    "temperature_c": 35.0,      # °C (suhu panas ekstrem)
+    "wind_speed_kmh": 30.0,    # km/jam (angin kencang)
+    "temperature_c": 35.0,     # °C (suhu panas ekstrem)
 }
+
+
+# ---------- Fungsi bantu ----------
+def _pastikan_tabel(conn, nama_tabel):
+    """Gagal eksplisit jika database atau tabel prasyarat belum ada."""
+    if not DB_FILE.exists():
+        raise AirflowFailException(
+            f"Database {DB_FILE} belum ada. Jalankan bmkg_weather_etl dulu."
+        )
+    ada = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (nama_tabel,)
+    ).fetchone()
+    if not ada:
+        raise AirflowFailException(f"Tabel {nama_tabel} belum ada di {DB_FILE}.")
 
 
 # ---------- Task ----------
 @task
 def detect_extreme_weather():
     """Pindai data prakiraan terbaru dan simpan peringatan cuaca ekstrem ke weather_alerts."""
-    if not DB_FILE.exists():
-        print(f"detect_extreme_weather: database {DB_FILE} belum ada")
-        return 0
-
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     try:
+        _pastikan_tabel(conn, "weather_forecast")
         cursor = conn.cursor()
-        table_exists = cursor.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='weather_forecast'"
-        ).fetchone()
-        if not table_exists:
-            print("detect_extreme_weather: tabel weather_forecast belum ada")
-            return 0
-
-        # Buat tabel weather_alerts secara idempoten
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS weather_alerts (
                 location_code TEXT,
@@ -59,30 +66,21 @@ def detect_extreme_weather():
             )
         """)
 
-        # Ambil data prakiraan terbaru (analysis_utc terkini per location_code)
-        # yang memenuhi salah satu kriteria cuaca ekstrem
+        # Data prakiraan dari analysis_utc terkini per lokasi yang memenuhi ambang
         query = """
-            SELECT 
-                wf.location_code,
-                wf.forecast_utc,
-                wf.forecast_local,
-                wf.province,
-                wf.city,
-                wf.district,
-                wf.village,
-                wf.temperature_c,
-                wf.precip,
-                wf.wind_speed_kmh,
-                wf.analysis_utc
+            SELECT
+                wf.location_code, wf.forecast_utc, wf.forecast_local,
+                wf.province, wf.city, wf.district, wf.village,
+                wf.temperature_c, wf.precip, wf.wind_speed_kmh, wf.analysis_utc
             FROM weather_forecast wf
             INNER JOIN (
                 SELECT location_code, MAX(analysis_utc) AS max_analysis
                 FROM weather_forecast
                 GROUP BY location_code
-            ) latest ON wf.location_code = latest.location_code 
+            ) latest ON wf.location_code = latest.location_code
                     AND wf.analysis_utc = latest.max_analysis
-            WHERE wf.precip > ? 
-               OR wf.wind_speed_kmh > ? 
+            WHERE wf.precip > ?
+               OR wf.wind_speed_kmh > ?
                OR wf.temperature_c >= ?
         """
         rows = cursor.execute(
@@ -95,72 +93,47 @@ def detect_extreme_weather():
         ).fetchall()
 
         if not rows:
-            print("detect_extreme_weather: tidak ada kondisi cuaca ekstrem pada data prakiraan terbaru")
             conn.commit()
+            print("detect_extreme_weather: tidak ada kondisi cuaca ekstrem pada data terbaru")
             return 0
 
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         alerts = []
-
         for r in rows:
-            loc = r["location_code"]
-            f_utc = r["forecast_utc"]
-            f_local = r["forecast_local"]
-            prov = r["province"]
-            city = r["city"]
-            dist = r["district"]
-            vill = r["village"]
+            meta = (r["location_code"], r["forecast_utc"])
+            info = (r["forecast_local"], r["province"], r["city"],
+                    r["district"], r["village"])
             ana = r["analysis_utc"]
 
-            # Evaluasi kondisi hujan lebat
             if r["precip"] is not None and r["precip"] > EXTREME_THRESHOLDS["precip"]:
-                alerts.append((
-                    loc, f_utc, "HEAVY_RAIN", f_local,
-                    prov, city, dist, vill,
-                    "precip", r["precip"], EXTREME_THRESHOLDS["precip"],
-                    "WARNING",
+                alerts.append(meta + ("HEAVY_RAIN",) + info + (
+                    "precip", r["precip"], EXTREME_THRESHOLDS["precip"], "WARNING",
                     f"Peringatan hujan lebat: {r['precip']} mm (> {EXTREME_THRESHOLDS['precip']} mm)",
-                    ana, now_str,
-                ))
+                    ana, now_str))
 
-            # Evaluasi kondisi angin kencang
             if r["wind_speed_kmh"] is not None and r["wind_speed_kmh"] > EXTREME_THRESHOLDS["wind_speed_kmh"]:
-                alerts.append((
-                    loc, f_utc, "STRONG_WIND", f_local,
-                    prov, city, dist, vill,
-                    "wind_speed_kmh", r["wind_speed_kmh"], EXTREME_THRESHOLDS["wind_speed_kmh"],
-                    "WARNING",
+                alerts.append(meta + ("STRONG_WIND",) + info + (
+                    "wind_speed_kmh", r["wind_speed_kmh"], EXTREME_THRESHOLDS["wind_speed_kmh"], "WARNING",
                     f"Peringatan angin kencang: {r['wind_speed_kmh']} km/jam (> {EXTREME_THRESHOLDS['wind_speed_kmh']} km/jam)",
-                    ana, now_str,
-                ))
+                    ana, now_str))
 
-            # Evaluasi kondisi suhu panas ekstrem
             if r["temperature_c"] is not None and r["temperature_c"] >= EXTREME_THRESHOLDS["temperature_c"]:
-                alerts.append((
-                    loc, f_utc, "EXTREME_HEAT", f_local,
-                    prov, city, dist, vill,
-                    "temperature_c", r["temperature_c"], EXTREME_THRESHOLDS["temperature_c"],
-                    "WARNING",
+                alerts.append(meta + ("EXTREME_HEAT",) + info + (
+                    "temperature_c", r["temperature_c"], EXTREME_THRESHOLDS["temperature_c"], "WARNING",
                     f"Peringatan suhu ekstrem: {r['temperature_c']} °C (>= {EXTREME_THRESHOLDS['temperature_c']} °C)",
-                    ana, now_str,
-                ))
+                    ana, now_str))
 
-        if alerts:
-            insert_sql = """
-                INSERT OR REPLACE INTO weather_alerts (
-                    location_code, forecast_utc, alert_type, forecast_local,
-                    province, city, district, village, metric_name,
-                    metric_value, threshold, severity, description,
-                    analysis_utc, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """
-            cursor.executemany(insert_sql, alerts)
-            conn.commit()
-            print(f"detect_extreme_weather: {len(alerts)} peringatan cuaca ekstrem disimpan ke weather_alerts")
+        cursor.executemany("""
+            INSERT OR REPLACE INTO weather_alerts (
+                location_code, forecast_utc, alert_type, forecast_local,
+                province, city, district, village, metric_name,
+                metric_value, threshold, severity, description,
+                analysis_utc, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, alerts)
+        conn.commit()
+        print(f"detect_extreme_weather: {len(alerts)} peringatan disimpan ke weather_alerts")
         return len(alerts)
-    except sqlite3.OperationalError as exc:
-        print(f"detect_extreme_weather: error database - {exc}")
-        return 0
     finally:
         conn.close()
 
@@ -168,21 +141,10 @@ def detect_extreme_weather():
 @task
 def build_daily_summary():
     """Hitung ringkasan statistik harian per lokasi dan simpan ke weather_daily_summary."""
-    if not DB_FILE.exists():
-        print(f"build_daily_summary: database {DB_FILE} belum ada")
-        return 0
-
     conn = sqlite3.connect(DB_FILE)
     try:
+        _pastikan_tabel(conn, "weather_forecast")
         cursor = conn.cursor()
-        table_exists = cursor.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='weather_forecast'"
-        ).fetchone()
-        if not table_exists:
-            print("build_daily_summary: tabel weather_forecast belum ada")
-            return 0
-
-        # Buat tabel weather_daily_summary secara idempoten
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS weather_daily_summary (
                 location_code TEXT,
@@ -202,9 +164,8 @@ def build_daily_summary():
             )
         """)
 
-        # Agregasi data prakiraan harian dari model analysis terbaru
         query = """
-            SELECT 
+            SELECT
                 wf.location_code,
                 wf.forecast_date_local,
                 MAX(wf.province) AS province,
@@ -222,34 +183,28 @@ def build_daily_summary():
                 SELECT location_code, MAX(analysis_utc) AS max_analysis
                 FROM weather_forecast
                 GROUP BY location_code
-            ) latest ON wf.location_code = latest.location_code 
+            ) latest ON wf.location_code = latest.location_code
                     AND wf.analysis_utc = latest.max_analysis
             GROUP BY wf.location_code, wf.forecast_date_local
         """
         rows = cursor.execute(query).fetchall()
-
         if not rows:
-            print("build_daily_summary: tidak ada data prakiraan untuk diringkas")
             conn.commit()
+            print("build_daily_summary: tidak ada data prakiraan untuk diringkas")
             return 0
 
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         records = [tuple(r) + (now_str,) for r in rows]
-
-        insert_sql = """
+        cursor.executemany("""
             INSERT OR REPLACE INTO weather_daily_summary (
                 location_code, forecast_date_local, province, city, district, village,
                 avg_temp_c, max_temp_c, min_temp_c, avg_humidity_pct,
                 total_precip_mm, avg_wind_speed, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """
-        cursor.executemany(insert_sql, records)
+        """, records)
         conn.commit()
-        print(f"build_daily_summary: {len(records)} baris ringkasan harian disimpan ke weather_daily_summary")
+        print(f"build_daily_summary: {len(records)} baris ringkasan disimpan")
         return len(records)
-    except sqlite3.OperationalError as exc:
-        print(f"build_daily_summary: error database - {exc}")
-        return 0
     finally:
         conn.close()
 
@@ -273,8 +228,8 @@ default_args = {
     tags=["uas", "bmkg", "analytics"],
 )
 def bmkg_weather_analytics():
-    extreme_alerts = detect_extreme_weather()
-    daily_summary = build_daily_summary()
+    detect_extreme_weather()
+    build_daily_summary()
 
 
 bmkg_weather_analytics()
